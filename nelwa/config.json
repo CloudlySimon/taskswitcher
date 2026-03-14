@@ -1,0 +1,6 @@
+{
+  "numberOfPlayers": 1,
+  "targetPlayer": "",
+  "targetPort": 8080,
+  "networkRanges": null
+}
