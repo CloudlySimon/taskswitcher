@@ -5,20 +5,24 @@
   "position": "bottom",
   "backgroundColor": "#2D2D30",
   "textColor": "#FFFFFF",
-  "cloudTask": {
-    "processName": "crestron",
-    "processFilePath": "C:\\Program Files\\Crestron\\MyProject.c3p",
-    "buttonLabel": "CRESTRON",
-    "enabled": true,
-    "isSystemExtension": true
-  },
-  "waveFrontTask": {
-    "processName": "msedge",
-    "processFilePath": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-    "arguments":["--kiosk","https://embr.cloudglobal.com","--user-agent","Shed5-Tablet"],
-    "buttonLabel": "DSP",
-    "enabled": true,
-    "switchOnly": true,
-    "windowTitleContains": "embr"
-  }
+  "tasks": [
+    {
+      "id": "crestron",
+      "processName": "crestron",
+      "processFilePath": "C:\\Program Files\\Crestron\\MyProject.c3p",
+      "buttonLabel": "CRESTRON",
+      "enabled": true,
+      "isSystemExtension": true
+    },
+    {
+      "id": "dsp",
+      "processName": "msedge",
+      "processFilePath": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "arguments": ["--kiosk", "https://embr.cloudglobal.com", "--user-agent", "Shed5-Tablet"],
+      "buttonLabel": "DSP",
+      "enabled": true,
+      "switchOnly": true,
+      "windowTitleContains": "embr"
+    }
+  ]
 }

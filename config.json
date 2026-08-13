@@ -5,18 +5,22 @@
   "position": "bottom",
   "backgroundColor": "#2D2D30",
   "textColor": "#FFFFFF",
-  "cloudTask": {
-    "processName": "elwa",
-    "processFilePath": "C:\\embr\\elwa\\elwa.exe",
-    "buttonLabel": "EMBR",
-    "enabled": true
-  },
-  "waveFrontTask": {
-    "processName": "CrestronXPanel",
-    "processFilePath": "C:\\embr\\crestron\\GhostDonkeyv1.1.c3p",
-    "buttonLabel": "CRESTRON",
-    "enabled": true,
-    "isSystemExtension": true,
-    "windowTitleContains": "Xpanel"
-  }
+  "tasks": [
+    {
+      "id": "embr",
+      "processName": "elwa",
+      "processFilePath": "C:\\embr\\elwa\\elwa.exe",
+      "buttonLabel": "EMBR",
+      "enabled": true
+    },
+    {
+      "id": "crestron",
+      "processName": "CrestronXPanel",
+      "processFilePath": "C:\\embr\\crestron\\GhostDonkeyv1.1.c3p",
+      "buttonLabel": "CRESTRON",
+      "enabled": true,
+      "isSystemExtension": true,
+      "windowTitleContains": "Xpanel"
+    }
+  ]
 }

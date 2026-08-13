@@ -3,6 +3,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"time"
 	"unsafe"
 
+	"taskswitcher/internal/asynclog"
 	"taskswitcher/internal/config"
 	"taskswitcher/internal/winutil"
 
@@ -25,21 +28,40 @@ import (
 )
 
 // Build-time visible version of the toolbar binary. Keep in sync with version.txt at repo root.
-const AppVersion = "0.1.4-dev"
+var AppVersion = "0.2.2-dev"
 
 type UI struct {
-	hwnd            windows.HWND
-	cfg             *config.AppConfig
-	mu              sync.Mutex
-	processing      bool
-	processingSince time.Time
-	lastLaunch      map[string]time.Time
-	buttonHWNDs     map[int]windows.HWND
-	pendingTask     string
-	// Tracks last time we accepted a BN_CLICKED per button id (UI thread only)
-	lastCmdAt map[int]time.Time
-	// Tracks last time a WM_TIMER heartbeat was observed (for watchdog)
+	hwnd        windows.HWND
+	cfg         *config.AppConfig
+	configPath  string
+	logPath     string
+	mu          sync.Mutex
+	buttonHWNDs map[int]windows.HWND
+	buttonTasks map[int]configuredTask
+	requests    chan taskRequest
+	nextID      uint64
+	workerState workerState
+	windowCache map[string]winutil.HWND
+	// Tracks the last time a WM_TIMER heartbeat was observed.
 	lastTimerAt time.Time
+}
+
+type taskRequest struct {
+	id          uint64
+	key         string
+	configIndex int
+	task        config.Task
+}
+
+type configuredTask struct {
+	index int
+	task  config.Task
+}
+
+type workerState struct {
+	requestID uint64
+	taskKey   string
+	startedAt time.Time
 }
 
 var (
@@ -48,12 +70,12 @@ var (
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
+	ole32    = windows.NewLazySystemDLL("ole32.dll")
 
 	procRegisterClassEx  = user32.NewProc("RegisterClassExW")
 	procCreateWindowEx   = user32.NewProc("CreateWindowExW")
 	procDefWindowProc    = user32.NewProc("DefWindowProcW")
 	procGetMessage       = user32.NewProc("GetMessageW")
-	procPeekMessage      = user32.NewProc("PeekMessageW")
 	procTranslateMessage = user32.NewProc("TranslateMessage")
 	procDispatchMessage  = user32.NewProc("DispatchMessageW")
 	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
@@ -66,18 +88,12 @@ var (
 	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
 	procPostMessage      = user32.NewProc("PostMessageW")
 	procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
-	procShowWindow2      = user32.NewProc("ShowWindow")
-	procSelectObject     = gdi32.NewProc("SelectObject")
-	procSetBkMode        = gdi32.NewProc("SetBkMode")
-	procSetTextColor     = gdi32.NewProc("SetTextColor")
+	procAttachConsole    = kernel32.NewProc("AttachConsole")
 	procSetTimer         = user32.NewProc("SetTimer")
-	procIsWindowEnabled  = user32.NewProc("IsWindowEnabled")
-	procEnableWindow     = user32.NewProc("EnableWindow")
-	procSetWindowLongPtr = user32.NewProc("SetWindowLongPtrW")
-	procGetWindowLongPtr = user32.NewProc("GetWindowLongPtrW")
-	procCallWindowProc   = user32.NewProc("CallWindowProcW")
-	procSendMessage      = user32.NewProc("SendMessageW")
-	procShellExecute     = shell32.NewProc("ShellExecuteW")
+	procMessageBox       = user32.NewProc("MessageBoxW")
+	procShellExecuteEx   = shell32.NewProc("ShellExecuteExW")
+	procCoInitializeEx   = ole32.NewProc("CoInitializeEx")
+	procCoUninitialize   = ole32.NewProc("CoUninitialize")
 )
 
 const (
@@ -96,32 +112,25 @@ const (
 	IDC_ARROW        = 32512
 	WM_COMMAND       = 0x0111
 	WM_TIMER         = 0x0113
-	WM_CLOSE         = 0x0010
 	WM_DESTROY       = 0x0002
 	WM_SYSKEYDOWN    = 0x0104
-	VK_F4            = 0x73
 	SM_CXSCREEN      = 0
-	SM_CYSCREEN      = 1
-	WM_LBUTTONUP     = 0x0202
-	WM_LBUTTONDOWN   = 0x0201
-	WM_LBUTTONDBLCLK = 0x0203
 	WM_SETCURSOR     = 0x0020
 	BN_CLICKED       = 0
-	// Button notifications (HIWORD(wParam))
-	BN_PAINT         = 1
-	BN_HILITE        = 2
-	BN_UNHILITE      = 3
-	BN_DISABLE       = 4
-	BN_DOUBLECLICKED = 5
-	BN_SETFOCUS      = 6
-	BN_KILLFOCUS     = 7
+	MB_OK            = 0
+	MB_ICONERROR     = 0x00000010
 
-	// Button IDs
-	ID_CLOUD_BTN = 1001
-	ID_AUDIO_BTN = 1002
-	
+	ID_TASK_BASE = 1001
+
 	// ShellExecute constants
-	SW_SHOWNORMAL = 1
+	SW_SHOWNORMAL            = 1
+	SEE_MASK_NOCLOSEPROCESS  = 0x00000040
+	SEE_MASK_NOASYNC         = 0x00000100
+	SEE_MASK_FLAG_NO_UI      = 0x00000400
+	SEE_MASK_UNICODE         = 0x00004000
+	SEE_MASK_FLAG_LOG_USAGE  = 0x04000000
+	COINIT_APARTMENTTHREADED = 0x2
+	COINIT_DISABLE_OLE1DDE   = 0x4
 )
 
 type WNDCLASSEX struct {
@@ -148,36 +157,31 @@ type MSG struct {
 	Pt      struct{ X, Y int32 }
 }
 
-var globalUI *UI
-var debugFile *os.File
-
-var (
-	btnOrigProc   = make(map[windows.HWND]uintptr)
-	hwndToID      = make(map[windows.HWND]int)
-	btnWndProcPtr uintptr
-)
-
-// Use a typed variable for GWLP_WNDPROC to allow conversion to uintptr without constant overflow
-var gwlpWndProc int32 = -4
-
-func debugLog(msg string) {
-	if debugFile != nil {
-		timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-		fmt.Fprintf(debugFile, "[%s] %s\n", timestamp, msg)
-		debugFile.Sync() // Force write to disk
-	}
+type SHELLEXECUTEINFO struct {
+	CbSize       uint32
+	FMask        uint32
+	Hwnd         windows.HWND
+	LpVerb       *uint16
+	LpFile       *uint16
+	LpParameters *uint16
+	LpDirectory  *uint16
+	NShow        int32
+	HInstApp     windows.Handle
+	LpIDList     unsafe.Pointer
+	LpClass      *uint16
+	HkeyClass    windows.Handle
+	DwHotKey     uint32
+	HIcon        windows.Handle
+	HProcess     windows.Handle
 }
 
-// readVersionFile reads version.txt from the project root (working directory) to assist
-// operators in confirming that the running binary matches the intended version.
+var globalUI *UI
+var debugWriter *asynclog.Writer
+var debugMode bool
+
+// readVersionFile reads version.txt next to the executable. It intentionally
+// avoids the working directory so kiosk startup is deterministic.
 func readVersionFile() string {
-	// 1) Try current working directory
-	if b, err := os.ReadFile("version.txt"); err == nil {
-		return strings.TrimSpace(string(b))
-	} else {
-		log.Printf("readVersionFile: not found at CWD: %s", filepath.Join(".", "version.txt"))
-	}
-	// 2) Try alongside the executable (common when started from other working dirs)
 	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
 		path := filepath.Join(dir, "version.txt")
@@ -193,7 +197,6 @@ func readVersionFile() string {
 }
 
 func hideConsoleWindow() {
-	// Get console window handle
 	consoleWindow, _, _ := procGetConsoleWindow.Call()
 	if consoleWindow != 0 {
 		// Hide the console window
@@ -201,25 +204,153 @@ func hideConsoleWindow() {
 	}
 }
 
+func showStartupError(message string) {
+	title, _ := syscall.UTF16PtrFromString("TaskSwitcher startup error")
+	body, _ := syscall.UTF16PtrFromString(message)
+	procMessageBox.Call(0, uintptr(unsafe.Pointer(body)), uintptr(unsafe.Pointer(title)), MB_OK|MB_ICONERROR)
+}
+
+func showTaskError(label string, failure error, configPath, logPath string, logWriteErr error) {
+	if strings.TrimSpace(label) == "" {
+		label = "task"
+	}
+	message := fmt.Sprintf("Could not open %s.\n\n%v\n\nConfiguration: %s\nDiagnostic log: %s", label, failure, configPath, logPath)
+	if logWriteErr != nil {
+		message += fmt.Sprintf("\n\nWarning: the diagnostic log could not be flushed: %v", logWriteErr)
+	}
+	title, _ := syscall.UTF16PtrFromString("TaskSwitcher launch failed")
+	body, _ := syscall.UTF16PtrFromString(message)
+	procMessageBox.Call(0, uintptr(unsafe.Pointer(body)), uintptr(unsafe.Pointer(title)), MB_OK|MB_ICONERROR)
+}
+
+func writeVersionOutput() {
+	line := []byte(AppVersion + "\r\n")
+	if err := writeStdout(line); err == nil {
+		return
+	}
+
+	// GUI-subsystem binaries normally have no console. Attach to the invoking
+	// shell and reacquire its stdout handle so `-version` remains scriptable.
+	attached, _, _ := procAttachConsole.Call(uintptr(0xFFFFFFFF)) // ATTACH_PARENT_PROCESS
+	if attached != 0 {
+		if err := writeStdout(line); err == nil {
+			return
+		}
+	}
+
+	// This only applies when -version was launched without a console or output
+	// redirection, for example by double-clicking a shortcut.
+	showStartupError("TaskSwitcher version " + AppVersion)
+}
+
+func writeStdout(contents []byte) error {
+	handle, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)
+	if err != nil {
+		return err
+	}
+	if handle == 0 || handle == windows.InvalidHandle {
+		return errors.New("standard output is unavailable")
+	}
+	var written uint32
+	if err := windows.WriteFile(handle, contents, &written, nil); err != nil {
+		return err
+	}
+	if int(written) != len(contents) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func executableDirectory() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
+func fileSHA256(path string) string {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "unavailable"
+	}
+	digest := sha256.Sum256(contents)
+	return fmt.Sprintf("%x", digest)
+}
+
+func operationalLogPaths() []string {
+	paths := []string{filepath.Join(executableDirectory(), "taskswitcher-toolbar.log")}
+	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+		fallback := filepath.Join(cacheDir, "TaskSwitcher", "taskswitcher-toolbar.log")
+		if fallback != paths[0] {
+			paths = append(paths, fallback)
+		}
+	}
+	return paths
+}
+
+func openOperationalLog() (io.WriteCloser, string, error) {
+	var failures []string
+	for _, path := range operationalLogPaths() {
+		file, err := asynclog.OpenRotatingFile(path, 5*1024*1024)
+		if err == nil {
+			return file, path, nil
+		}
+		failures = append(failures, fmt.Sprintf("%s: %v", path, err))
+	}
+	return nil, "", fmt.Errorf("could not create the TaskSwitcher log file (%s)", strings.Join(failures, "; "))
+}
+
 func main() {
 	// Flags
 	var configPath string
 	var debugEnabled bool
-	flag.StringVar(&configPath, "config", "config.json", "Path to config file")
-	flag.BoolVar(&debugEnabled, "debug", false, "Enable debug logging to taskswitcher-toolbar-debug.log")
+	var showVersion bool
+	flag.StringVar(&configPath, "config", "", "Path to config file (defaults to config.json next to the executable)")
+	flag.BoolVar(&debugEnabled, "debug", false, "Enable verbose operational logging")
+	flag.BoolVar(&showVersion, "version", false, "Print the executable version and exit")
 	flag.Parse()
+	if showVersion {
+		writeVersionOutput()
+		return
+	}
+	debugMode = debugEnabled
+	if strings.TrimSpace(configPath) == "" {
+		configPath = filepath.Join(executableDirectory(), "config.json")
+	} else if abs, err := filepath.Abs(configPath); err == nil {
+		configPath = abs
+	}
 
-	// Configure logging based on debug flag
+	releaseInstance, acquired, err := winutil.AcquireSingleInstance("Local\\TaskSwitcherToolbar")
+	if err != nil {
+		showStartupError(fmt.Sprintf("Failed to create single-instance mutex: %v", err))
+		return
+	}
+	if !acquired {
+		return
+	}
+	defer releaseInstance()
+
+	// Always retain a bounded operational log. Prefer a discoverable file next
+	// to the executable and fall back to the current user's cache directory.
+	// The async writer ensures that slow storage cannot block the UI thread.
+	logFile, logPath, err := openOperationalLog()
+	if err != nil {
+		showStartupError(err.Error())
+		return
+	}
+	debugWriter = asynclog.New(logFile, 1024)
+	log.SetOutput(debugWriter)
+	defer func() {
+		if debugWriter != nil {
+			if dropped := debugWriter.Dropped(); dropped != 0 {
+				log.Printf("async logger dropped %d records", dropped)
+			}
+			_ = debugWriter.Close()
+		}
+	}()
+
 	if debugEnabled {
-		var err error
-		debugFile, err = os.OpenFile("taskswitcher-toolbar-debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			// If we can't create log file, continue without it
-			debugFile = nil
-		}
-		if debugFile != nil {
-			log.SetOutput(debugFile)
-		}
 		log.Printf("=== TOOLBAR APPLICATION STARTING ===")
 		// Print binary version and compare with version.txt
 		log.Printf("Toolbar AppVersion: %s", AppVersion)
@@ -233,39 +364,53 @@ func main() {
 			log.Printf("version.txt not found or unreadable; proceeding")
 		}
 		log.Printf("Loading config from: %s", configPath)
-	} else {
-		// Discard logs by default when not in debug mode
-		log.SetOutput(io.Discard)
 	}
+	executablePath, _ := os.Executable()
+	log.Printf("TaskSwitcher starting: version=%s executable=%q config=%q configSHA256=%s log=%q debug=%v", AppVersion, executablePath, configPath, fileSHA256(configPath), logPath, debugEnabled)
 
-	cfg, err := config.Load(configPath)
+	cfg, configCreated, err := config.LoadOrCreate(configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		message := fmt.Sprintf("Failed to load config %q: %v\n\nDiagnostic log: %s", configPath, err, logPath)
+		log.Printf("%s", message)
+		_ = debugWriter.Flush(2 * time.Second)
+		showStartupError(message)
+		return
+	}
+	if configCreated {
+		log.Printf("Default config created: %q", configPath)
+		log.Printf("TaskSwitcher is exiting after first-run config generation; review tasks[].processName, tasks[].processFilePath, and tasks[].windowTitleContains, then start it again")
+		_ = debugWriter.Flush(2 * time.Second)
+		return
 	}
 
-	log.Printf("Config loaded successfully:")
-	log.Printf("  CloudTask.ProcessName: '%s'", cfg.CloudTask.ProcessName)
-	log.Printf("  CloudTask.ButtonLabel: '%s'", cfg.CloudTask.ButtonLabel)
-	log.Printf("  WaveFrontTask.ProcessName: '%s'", cfg.WaveFrontTask.ProcessName)
-	log.Printf("  WaveFrontTask.ButtonLabel: '%s'", cfg.WaveFrontTask.ButtonLabel)
+	log.Printf("Config loaded successfully: tasks=%d", len(cfg.Tasks))
+	for index, task := range cfg.Tasks {
+		log.Printf("  tasks[%d]: id=%q processName=%q buttonLabel=%q enabled=%v", index, task.ID, task.ProcessName, task.ButtonLabel, task.IsEnabled())
+	}
 
 	// Hide console window
 	hideConsoleWindow()
 
 	log.Printf("Creating UI instance...")
-	ui := &UI{cfg: cfg, lastLaunch: make(map[string]time.Time), buttonHWNDs: make(map[int]windows.HWND), processingSince: time.Time{}, lastCmdAt: make(map[int]time.Time), lastTimerAt: time.Time{}}
+	ui := &UI{
+		cfg:         cfg,
+		configPath:  configPath,
+		logPath:     logPath,
+		buttonHWNDs: make(map[int]windows.HWND),
+		buttonTasks: make(map[int]configuredTask),
+		requests:    make(chan taskRequest, 1),
+		windowCache: make(map[string]winutil.HWND),
+	}
 	globalUI = ui // Set global reference for window procedure
 	log.Printf("Global UI reference set")
 	log.Printf("Starting UI run...")
-	ui.run()
-
-	// Cleanup
-	if debugFile != nil {
-		debugFile.Close()
+	if err := ui.run(); err != nil {
+		log.Printf("Toolbar stopped with an error: %v", err)
+		showStartupError(err.Error())
 	}
 }
 
-func (u *UI) run() {
+func (u *UI) run() error {
 	// Ensure the window is created and message loop runs on the same OS thread.
 	// This is required for Win32 GUI correctness (message queue is per-thread).
 	runtime.LockOSThread()
@@ -311,9 +456,9 @@ func (u *UI) run() {
 	log.Printf("Step 4 COMPLETE: WNDCLASSEX structure created")
 
 	log.Printf("Step 5: Registering window class...")
-	atom, _, _ := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+	atom, _, callErr := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
 	if atom == 0 {
-		log.Fatal("Failed to register window class")
+		return fmt.Errorf("register window class: %w", callErr)
 	}
 	log.Printf("Step 5 COMPLETE: Window class registered successfully, atom=%d", atom)
 
@@ -321,7 +466,7 @@ func (u *UI) run() {
 	log.Printf("Step 6: Getting work area dimensions...")
 	left, top, right, bottom, ok := winutil.GetWorkArea()
 	if !ok {
-		log.Fatal("Failed to get work area")
+		return errors.New("failed to get Windows work area")
 	}
 	width := right - left
 	log.Printf("Step 6 COMPLETE: Work area: left=%d, top=%d, right=%d, bottom=%d, width=%d", left, top, right, bottom, width)
@@ -343,7 +488,7 @@ func (u *UI) run() {
 	// Create window
 	log.Printf("Step 8: Creating main window...")
 	windowName, _ := syscall.UTF16PtrFromString("Task Switcher")
-	hwnd, _, _ := procCreateWindowEx.Call(
+	hwnd, _, callErr := procCreateWindowEx.Call(
 		WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
@@ -358,7 +503,7 @@ func (u *UI) run() {
 	)
 
 	if hwnd == 0 {
-		log.Fatal("Failed to create window")
+		return fmt.Errorf("create toolbar window: %w", callErr)
 	}
 	log.Printf("Step 8 COMPLETE: Main window created successfully, hwnd=%d", hwnd)
 
@@ -368,6 +513,7 @@ func (u *UI) run() {
 	log.Printf("Step 9: Creating buttons...")
 	u.createButtons()
 	log.Printf("Step 9 COMPLETE: Buttons created")
+	go u.commandWorker()
 
 	// Show window first
 	log.Printf("Step 10: Showing window...")
@@ -375,7 +521,7 @@ func (u *UI) run() {
 	log.Printf("Step 10a: ShowWindow result: %d", showResult)
 	updateResult, _, _ := procUpdateWindow.Call(uintptr(u.hwnd))
 	log.Printf("Step 10b: UpdateWindow result: %d", updateResult)
-	
+
 	// Ensure window maintains correct size and position after showing
 	log.Printf("Step 10c: Ensuring correct window size and position...")
 	setResult, _, _ := procSetWindowPos.Call(
@@ -406,31 +552,23 @@ func (u *UI) run() {
 		}
 	}
 
-	// Start a secondary Go ticker heartbeat to confirm process liveness even if WM_TIMER stops
+	// Observe UI message-pump latency from outside the UI thread. This monitor is
+	// diagnostic only; it never mutates command state or posts recovery messages.
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		var lastReported time.Time
 		for range ticker.C {
-			// Snapshot state under lock
 			u.mu.Lock()
-			proc := u.processing
 			lastT := u.lastTimerAt
-			hwnd := u.hwnd
+			worker := u.workerState
 			u.mu.Unlock()
 
-			log.Printf("GoTicker heartbeat: processing=%v", proc)
-
-			// Watch for missing WM_TIMER delivery and attempt recovery
 			if !lastT.IsZero() {
 				gap := time.Since(lastT)
-				if gap > 2500*time.Millisecond && hwnd != 0 {
-					log.Printf("GoTicker: detected WM_TIMER gap of %v (>2.5s); re-arming timer and posting synthetic WM_TIMER", gap)
-					// Re-arm the window timer (id=1) and post a synthetic WM_TIMER
-					if tid, _, _ := procSetTimer.Call(uintptr(hwnd), 1, 1000, 0); tid == 0 {
-						log.Printf("GoTicker: SetTimer re-arm failed")
-					} else {
-						procPostMessage.Call(uintptr(hwnd), uintptr(WM_TIMER), 1, 0)
-					}
+				if gap > 2500*time.Millisecond && (lastReported.IsZero() || time.Since(lastReported) >= 10*time.Second) {
+					log.Printf("UI heartbeat delayed by %v; worker request=%d task=%q age=%v", gap, worker.requestID, worker.taskKey, workerAge(worker))
+					lastReported = time.Now()
 				}
 			}
 		}
@@ -439,11 +577,14 @@ func (u *UI) run() {
 	// Start message loop (blocking)
 	log.Printf("Step 11: Starting message loop (BLOCKING)...")
 	log.Printf("=== APPLICATION STARTUP COMPLETE ===")
-	u.messageLoop()
+	if err := u.messageLoop(); err != nil {
+		return err
+	}
 	log.Printf("Step 11 COMPLETE: Message loop ended - application shutting down")
+	return nil
 }
 
-func (u *UI) messageLoop() {
+func (u *UI) messageLoop() error {
 	log.Printf("=== MESSAGE LOOP STARTING ===")
 	var msg MSG
 	msgCount := 0
@@ -455,8 +596,7 @@ func (u *UI) messageLoop() {
 			0,
 		)
 		if int32(ret) == -1 { // error
-			log.Printf("GetMessage failed; exiting message loop")
-			break
+			return errors.New("GetMessageW failed")
 		}
 		if ret == 0 { // WM_QUIT
 			log.Printf("WM_QUIT received, exiting message loop")
@@ -464,7 +604,7 @@ func (u *UI) messageLoop() {
 		}
 
 		msgCount++
-		if (msgCount%100 == 1 && msg.Message != WM_SETCURSOR) || msg.Message == WM_COMMAND || msg.Message == WM_DESTROY || msg.Message == WM_TIMER {
+		if debugMode && ((msgCount%100 == 1 && msg.Message != WM_SETCURSOR) || msg.Message == WM_COMMAND || msg.Message == WM_DESTROY) {
 			log.Printf("Processing message %d: type=%d, wParam=%d, lParam=%d", msgCount, msg.Message, msg.WParam, msg.LParam)
 		}
 
@@ -472,6 +612,7 @@ func (u *UI) messageLoop() {
 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 	log.Printf("=== MESSAGE LOOP ENDED ===")
+	return nil
 }
 
 func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
@@ -485,7 +626,9 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		cmdID := int(wParam & 0xFFFF)
 		notifyCode := (wParam >> 16) & 0xFFFF
 		// Diagnostics: WM_COMMAND from child controls delivers lParam = child HWND
-		log.Printf("WM_COMMAND received: id=%d, notify=%d, childHWND=%d", cmdID, notifyCode, lParam)
+		if debugMode {
+			log.Printf("WM_COMMAND received: id=%d, notify=%d, childHWND=%d", cmdID, notifyCode, lParam)
+		}
 
 		// Check if globalUI is initialized
 		if globalUI == nil {
@@ -505,80 +648,17 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			// Unknown command id
 			return 0
 		}
-		// De-duplicate double-delivered BN_CLICKED (subclass + native) within a short window
-		if globalUI.lastCmdAt != nil {
-			now := time.Now()
-			if t, ok := globalUI.lastCmdAt[cmdID]; ok {
-				if now.Sub(t) < 90*time.Millisecond {
-					log.Printf("WM_COMMAND: duplicate BN_CLICKED for id=%d ignored (delta=%v < 90ms)", cmdID, now.Sub(t))
-					return 0
-				}
-			}
-			globalUI.lastCmdAt[cmdID] = now
+		configured, ok := globalUI.buttonTasks[cmdID]
+		if !ok {
+			return 0
 		}
-
-		switch cmdID {
-		case ID_CLOUD_BTN:
-			globalUI.safeButtonClick(globalUI.cfg.CloudTask.ProcessName)
-		case ID_AUDIO_BTN:
-			globalUI.safeButtonClick(globalUI.cfg.WaveFrontTask.ProcessName)
-		}
+		globalUI.requestTask(configured.index, configured.task)
 		return 0
 	case WM_TIMER:
-		// UI heartbeat to verify message processing during potential stalls
-		procState := false
-		age := time.Duration(0)
-		pending := ""
 		if globalUI != nil {
 			globalUI.mu.Lock()
-			// Record last WM_TIMER arrival time for watchdog logic
 			globalUI.lastTimerAt = time.Now()
-			procState = globalUI.processing
-			if procState && !globalUI.processingSince.IsZero() {
-				age = time.Since(globalUI.processingSince)
-			}
-			pending = globalUI.pendingTask
 			globalUI.mu.Unlock()
-		}
-		log.Printf("WM_TIMER heartbeat: id=%d, processing=%v, age=%v, pendingTask=%q", wParam, procState, age, pending)
-		// Watchdog: if processing appears stuck for >3s, clear it
-		if globalUI != nil {
-			globalUI.mu.Lock()
-			if globalUI.processing && !globalUI.processingSince.IsZero() {
-				if time.Since(globalUI.processingSince) > 3*time.Second {
-					log.Printf("Watchdog: clearing stuck processing state (age=%v)", time.Since(globalUI.processingSince))
-					globalUI.processing = false
-				}
-			}
-			// Drain a single pending task if we're idle now
-			var toLaunch string
-			if !globalUI.processing && globalUI.pendingTask != "" {
-				toLaunch = globalUI.pendingTask
-				globalUI.pendingTask = ""
-				log.Printf("WM_TIMER: draining pendingTask=%s", toLaunch)
-			}
-			// Copy button HWNDs to check enable state outside the lock
-			handles := make([]windows.HWND, 0, len(globalUI.buttonHWNDs))
-			for _, h := range globalUI.buttonHWNDs {
-				handles = append(handles, h)
-			}
-			globalUI.mu.Unlock()
-
-			if toLaunch != "" {
-				// Call outside of lock to avoid deadlock
-				globalUI.safeButtonClick(toLaunch)
-			}
-			// Ensure buttons are enabled (Windows can disable after certain interactions)
-			for _, h := range handles {
-				if h == 0 {
-					continue
-				}
-				enabled, _, _ := procIsWindowEnabled.Call(uintptr(h))
-				if enabled == 0 {
-					log.Printf("WM_TIMER: button hwnd=%d was disabled; re-enabling", h)
-					procEnableWindow.Call(uintptr(h), 1)
-				}
-			}
 		}
 		return 0
 	case WM_DESTROY:
@@ -590,49 +670,10 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		// Let DefWindowProc handle system keys
 	default:
 		// Only log unusual messages
-		if msg != 15 && msg != 20 && msg != 132 && msg != 30 && msg != 512 {
+		if debugMode && msg != 15 && msg != 20 && msg != 132 && msg != 30 && msg != 512 {
 			log.Printf("Window message: %d (wParam=%d, lParam=%d)", msg, wParam, lParam)
 		}
 	}
-	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
-	return ret
-}
-
-func btnWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("btnWndProc: recovered from panic: %v (msg=%d, wParam=%d, lParam=%d)", r, msg, wParam, lParam)
-		}
-	}()
-	// Extra mouse diagnostics
-	if msg == WM_LBUTTONDOWN {
-		log.Printf("btnWndProc: WM_LBUTTONDOWN hwnd=%d", hwnd)
-	}
-	if msg == WM_LBUTTONDBLCLK {
-		// Do not synthesize BN_CLICKED here; treat as double-click diagnostic only
-		log.Printf("btnWndProc: WM_LBUTTONDBLCLK hwnd=%d", hwnd)
-	}
-	// On mouse up over the button, ensure BN_CLICKED reaches parent
-	if msg == WM_LBUTTONUP {
-		log.Printf("btnWndProc: WM_LBUTTONUP hwnd=%d", hwnd)
-		if globalUI != nil {
-			id, ok := hwndToID[windows.HWND(hwnd)]
-			if ok {
-				// Compose WPARAM = MAKEWPARAM(id, BN_CLICKED)
-				w := uintptr(uint32(id)&0xFFFF | (uint32(BN_CLICKED)&0xFFFF)<<16)
-				// lParam = child HWND
-				log.Printf("btnWndProc: WM_LBUTTONUP -> synthesize BN_CLICKED for id=%d, hwnd=%d", id, hwnd)
-				// Use PostMessage to avoid reentrancy into parent wndProc
-				procPostMessage.Call(uintptr(globalUI.hwnd), uintptr(WM_COMMAND), w, hwnd)
-			}
-		}
-	}
-	// Call original button proc
-	if prev, ok := btnOrigProc[windows.HWND(hwnd)]; ok && prev != 0 {
-		ret, _, _ := procCallWindowProc.Call(prev, hwnd, uintptr(msg), wParam, lParam)
-		return ret
-	}
-	// Fallback to DefWindowProc if we somehow lost the original
 	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
 	return ret
 }
@@ -653,34 +694,22 @@ func (u *UI) createButtons() {
 	// Only create buttons that are configured and enabled
 	var buttons []buttonInfo
 
-	// Cloud Music System button
-	if u.cfg.CloudTask.ProcessName != "" && u.cfg.CloudTask.IsEnabled() {
-		buttonText := u.cfg.CloudTask.ButtonLabel
-		log.Printf("DEBUG: CloudTask.ButtonLabel = '%s'", buttonText)
-		if buttonText == "" {
-			buttonText = "CLOUD MUSIC SYSTEM"
-			log.Printf("DEBUG: Using fallback button text: '%s'", buttonText)
+	for index, task := range u.cfg.Tasks {
+		if !task.IsEnabled() {
+			continue
 		}
-		buttons = append(buttons, buttonInfo{
-			text:  buttonText,
-			width: 220,
-			id:    ID_CLOUD_BTN,
-		})
+		commandID := ID_TASK_BASE + index
+		buttons = append(buttons, buttonInfo{text: task.ButtonLabel, width: 220, id: commandID})
+		u.buttonTasks[commandID] = configuredTask{index: index, task: task}
 	}
-
-	// Audio Visual System button
-	if u.cfg.WaveFrontTask.ProcessName != "" && u.cfg.WaveFrontTask.IsEnabled() {
-		buttonText := u.cfg.WaveFrontTask.ButtonLabel
-		log.Printf("DEBUG: WaveFrontTask.ButtonLabel = '%s'", buttonText)
-		if buttonText == "" {
-			buttonText = "AUDIO VISUAL SYSTEM"
-			log.Printf("DEBUG: Using fallback button text: '%s'", buttonText)
+	if len(buttons) == 0 {
+		return
+	}
+	availableWidth := int(screenWidth) - buttonSpacing*(len(buttons)-1)
+	if fittedWidth := availableWidth / len(buttons); fittedWidth < 220 {
+		for index := range buttons {
+			buttons[index].width = fittedWidth
 		}
-		buttons = append(buttons, buttonInfo{
-			text:  buttonText,
-			width: 220,
-			id:    ID_AUDIO_BTN,
-		})
 	}
 
 	// Calculate total width and center the buttons
@@ -703,10 +732,9 @@ func (u *UI) createButtons() {
 }
 
 type buttonInfo struct {
-	text    string
-	width   int
-	id      int
-	isLabel bool
+	text  string
+	width int
+	id    int
 }
 
 func (u *UI) createStyledButton(text string, x, y, width, height int, id int) {
@@ -728,18 +756,6 @@ func (u *UI) createStyledButton(text string, x, y, width, height int, id int) {
 		log.Printf("Button created: hwnd=%d, id=%d, text='%s'", hwnd, id, text)
 		if u.buttonHWNDs != nil {
 			u.buttonHWNDs[id] = windows.HWND(hwnd)
-		}
-		// Track reverse map and subclass to ensure clicks are delivered
-		hwndToID[windows.HWND(hwnd)] = id
-		if btnWndProcPtr == 0 {
-			btnWndProcPtr = syscall.NewCallback(btnWndProc)
-		}
-		prev, _, _ := procSetWindowLongPtr.Call(hwnd, uintptr(gwlpWndProc), btnWndProcPtr)
-		if prev != 0 {
-			btnOrigProc[windows.HWND(hwnd)] = prev
-			log.Printf("Subclassed button hwnd=%d (id=%d), prevProc=%#x", hwnd, id, prev)
-		} else {
-			log.Printf("WARNING: failed to subclass button hwnd=%d (id=%d)", hwnd, id)
 		}
 		if u.cfg.BackgroundColor != "" || u.cfg.TextColor != "" {
 			u.applyButtonColors(windows.HWND(hwnd))
@@ -772,230 +788,251 @@ func (u *UI) applyButtonColors(hwnd windows.HWND) {
 	// This is a placeholder for the color functionality
 }
 
-func (u *UI) createStyledLabel(text string, x, y, width, height int) {
-	labelText, _ := syscall.UTF16PtrFromString(text)
-	className, _ := syscall.UTF16PtrFromString("STATIC")
-
-	// Create centered label with modern styling
-	procCreateWindowEx.Call(
-		0,
-		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(labelText)),
-		0x50000000|0x00000001|0x00000200, // WS_VISIBLE | WS_CHILD | SS_CENTER | SS_CENTERIMAGE
-		uintptr(x), uintptr(y), uintptr(width), uintptr(height),
-		uintptr(u.hwnd),
-		0, 0, 0,
-	)
-}
-
-func (u *UI) safeButtonClick(processName string) {
+func (u *UI) requestTask(configIndex int, task config.Task) {
+	key := task.ID
 	u.mu.Lock()
-	log.Printf("safeButtonClick: requested for %s (processing=%v)", processName, u.processing)
-	// Debounce rapid repeated clicks per task (200ms window)
-	now := time.Now()
-	if t, ok := u.lastLaunch[processName]; ok {
-		if elapsed := now.Sub(t); elapsed < 200*time.Millisecond {
-			log.Printf("safeButtonClick: debounce - ignoring duplicate for %s (elapsed=%v < 200ms)", processName, elapsed)
-			// If we're idle and have no pending task, schedule a short delayed fire to keep UX responsive
-			if !u.processing && u.pendingTask == "" {
-				u.pendingTask = processName
-				log.Printf("safeButtonClick: scheduled pendingTask=%s after debounce (delayed fire)", processName)
-				// Capture UI pointer safely
-				ui := u
-				time.AfterFunc(120*time.Millisecond, func() {
-					ui.mu.Lock()
-					toLaunch := ""
-					if !ui.processing && ui.pendingTask != "" {
-						toLaunch = ui.pendingTask
-						ui.pendingTask = ""
-						log.Printf("debounce-delayed: firing pendingTask=%s", toLaunch)
-					}
-					ui.mu.Unlock()
-					if toLaunch != "" {
-						ui.safeButtonClick(toLaunch)
-					}
-				})
-			}
-			u.mu.Unlock()
-			return
-		}
-	}
-
-	if u.processing {
-		// Queue a single pending task so we don't lose a click
-		if u.pendingTask == "" {
-			u.pendingTask = processName
-			log.Printf("safeButtonClick: already processing, queued pendingTask=%s", processName)
-		} else {
-			log.Printf("safeButtonClick: already processing, pendingTask exists=%s; ignoring %s", u.pendingTask, processName)
-		}
-		u.mu.Unlock()
-		return // Already processing, ignore click
-	}
-	// Mark processing and record timestamp, then release the lock before heavy work
-	u.processing = true
-	u.processingSince = now
-	u.lastLaunch[processName] = now
+	u.nextID++
+	request := taskRequest{id: u.nextID, key: key, configIndex: configIndex, task: task}
 	u.mu.Unlock()
 
-	go func() {
-		start := time.Now()
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("safeButtonClick: panic during launch of %s: %v", processName, r)
+	select {
+	case u.requests <- request:
+		log.Printf("request %d queued for %s", request.id, key)
+		return
+	default:
+	}
+
+	var replaced taskRequest
+	select {
+	case replaced = <-u.requests:
+	default:
+	}
+	select {
+	case u.requests <- request:
+		log.Printf("request %d for %s replaced queued request %d for %s", request.id, key, replaced.id, replaced.key)
+	default:
+		// The worker won the race and consumed the queued request. Dropping this
+		// extra tap is preferable to ever blocking the UI thread.
+		log.Printf("request %d for %s dropped during queue handoff", request.id, key)
+	}
+}
+
+func workerAge(state workerState) time.Duration {
+	if state.startedAt.IsZero() {
+		return 0
+	}
+	return time.Since(state.startedAt)
+}
+
+func (u *UI) commandWorker() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	hresult, _, _ := procCoInitializeEx.Call(0, COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE)
+	comInitialized := int32(hresult) >= 0
+	if comInitialized {
+		defer procCoUninitialize.Call()
+	} else {
+		log.Printf("CoInitializeEx failed: HRESULT=%#x; executable launches remain available", uint32(hresult))
+	}
+
+	for request := range u.requests {
+		started := time.Now()
+		u.mu.Lock()
+		u.workerState = workerState{requestID: request.id, taskKey: request.key, startedAt: started}
+		u.mu.Unlock()
+
+		err := u.executeRequest(request)
+		if err != nil {
+			u.logTaskFailure(request, time.Since(started), err)
+			var flushErr error
+			if debugWriter != nil {
+				flushErr = debugWriter.Flush(2 * time.Second)
 			}
-			u.mu.Lock()
-			u.processing = false
-			u.mu.Unlock()
-			log.Printf("safeButtonClick: completed %s in %v", processName, time.Since(start))
-		}()
-		log.Printf("safeButtonClick: launching %s now", processName)
-		u.simpleLaunch(processName)
+			showTaskError(request.task.ButtonLabel, err, u.configPath, u.logPath, flushErr)
+		} else {
+			log.Printf("request %d for %s completed in %v", request.id, request.key, time.Since(started))
+		}
+
+		u.mu.Lock()
+		if u.workerState.requestID == request.id {
+			u.workerState = workerState{}
+		}
+		u.mu.Unlock()
+	}
+}
+
+func (u *UI) logTaskFailure(request taskRequest, elapsed time.Duration, failure error) {
+	section := fmt.Sprintf("tasks[%d]", request.configIndex)
+	effectiveWorkingDirectory := strings.TrimSpace(request.task.WorkingDirectory)
+	if effectiveWorkingDirectory == "" && request.task.ProcessFilePath != "" {
+		effectiveWorkingDirectory = filepath.Dir(request.task.ProcessFilePath)
+	}
+	log.Printf("TASK LAUNCH FAILED\n  requestID: %d\n  elapsed: %v\n  button: %q\n  configFile: %q\n  logFile: %q\n  failure: %v\n  relevant config values:\n    %s.id: %q\n    %s.processName: %q\n    %s.processFilePath: %q\n    %s.arguments: %q\n    %s.workingDirectory: %q\n    effectiveWorkingDirectory: %q\n    %s.windowTitleContains: %q\n    %s.switchOnly: %v\n    %s.isSystemExtension: %v",
+		request.id,
+		elapsed,
+		request.task.ButtonLabel,
+		u.configPath,
+		u.logPath,
+		failure,
+		section, request.task.ID,
+		section, request.task.ProcessName,
+		section, request.task.ProcessFilePath,
+		section, request.task.Arguments,
+		section, request.task.WorkingDirectory,
+		effectiveWorkingDirectory,
+		section, request.task.WindowTitleContains,
+		section, request.task.IsSwitchOnly(),
+		section, request.task.IsSystemExtension,
+	)
+}
+
+func (u *UI) executeRequest(request taskRequest) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic while handling %s: %v", request.key, recovered)
+		}
 	}()
+	return u.switchOrLaunch(request.configIndex, request.key, request.task)
 }
 
-func bringWindowToFront(hwnd winutil.HWND) {
-	// If window is minimized, restore it
+func bringWindowToFront(hwnd winutil.HWND) error {
+	if !winutil.IsWindow(hwnd) {
+		return errors.New("target window is no longer valid")
+	}
 	if winutil.IsIconic(hwnd) {
-		winutil.ShowWindow(hwnd, 9) // SW_RESTORE
+		winutil.ShowWindow(hwnd, winutil.SW_RESTORE)
 	}
-	// Bring window to foreground
-	winutil.SetForegroundWindow(hwnd)
+	if !winutil.SetForegroundWindow(hwnd) {
+		return errors.New("Windows rejected foreground activation")
+	}
+	return nil
 }
 
-func (u *UI) simpleLaunch(task string) {
-	// Get task configuration
-	var taskConfig *config.Task
-	if task == u.cfg.CloudTask.ProcessName {
-		taskConfig = &u.cfg.CloudTask
-	} else if task == u.cfg.WaveFrontTask.ProcessName {
-		taskConfig = &u.cfg.WaveFrontTask
-	} else {
-		log.Printf("Unknown task: %s", task)
-		return
-	}
-
-	// Check for window by title hint if provided (works for any process type)
-	titleHint := taskConfig.WindowTitleContains
-	if strings.TrimSpace(titleHint) != "" {
-		if hwnd := winutil.FindProcessWindowByExeAndTitleContains(task, titleHint); hwnd != 0 {
-			log.Printf("simpleLaunch: found window by title contains '%s' for process %s", titleHint, task)
-			bringWindowToFront(hwnd)
-			return
+func (u *UI) switchOrLaunch(configIndex int, key string, task config.Task) error {
+	section := fmt.Sprintf("tasks[%d]", configIndex)
+	if cached := u.windowCache[key]; winutil.IsWindow(cached) {
+		if err := bringWindowToFront(cached); err == nil {
+			return nil
 		}
+		delete(u.windowCache, key)
 	}
 
-	// Check if process is already running by process name (general case)
-	_, hwnd, err := winutil.FindFirstWindowByProcessName(task)
-	if err == nil && hwnd != 0 {
-		log.Printf("simpleLaunch: found existing window for %s, bringing to front", task)
-		bringWindowToFront(hwnd)
-		return
+	lookupStarted := time.Now()
+	_, hwnd, lookupErr := winutil.FindProcessWindow(task.ProcessName, task.WindowTitleContains)
+	log.Printf("window lookup for %s completed in %v (found=%v, err=%v)", key, time.Since(lookupStarted), hwnd != 0, lookupErr)
+	if hwnd != 0 {
+		u.windowCache[key] = hwnd
+		return bringWindowToFront(hwnd)
+	}
+	if task.IsSwitchOnly() {
+		return fmt.Errorf("no visible window matched %s.processName=%q and %s.windowTitleContains=%q; %s.switchOnly is true, so TaskSwitcher will not launch it. Correct the process name/title, start the application separately, or set switchOnly to false and configure processFilePath", section, task.ProcessName, section, task.WindowTitleContains, section)
 	}
 
-	// Handle system extensions (like .c3p files) using ShellExecute
-	if taskConfig.IsSystemExtension {
-		log.Printf("simpleLaunch: no existing process found, launching system extension %s", taskConfig.ProcessFilePath)
-		// Determine working directory: prefer configured WorkingDirectory, else directory of the file
-		workDir := strings.TrimSpace(taskConfig.WorkingDirectory)
-		if workDir == "" && taskConfig.ProcessFilePath != "" {
-			workDir = filepath.Dir(taskConfig.ProcessFilePath)
+	workDir := strings.TrimSpace(task.WorkingDirectory)
+	if workDir == "" && task.ProcessFilePath != "" {
+		workDir = filepath.Dir(task.ProcessFilePath)
+	}
+	if err := validateLaunchTarget(section, task, workDir); err != nil {
+		return err
+	}
+
+	if task.IsSystemExtension {
+		if err := launchSystemExtension(task.ProcessFilePath, workDir); err != nil {
+			extension := filepath.Ext(task.ProcessFilePath)
+			return fmt.Errorf("Windows could not open %s.processFilePath=%q: %w. Confirm that the file exists and that Windows has an application associated with %q files", section, task.ProcessFilePath, err, extension)
 		}
-		u.launchSystemExtension(taskConfig.ProcessFilePath, workDir)
-		return
-	}
-
-	// Launch new process with arguments
-	var cmd *exec.Cmd
-	if len(taskConfig.Arguments) > 0 {
-		cmd = exec.Command(taskConfig.ProcessFilePath, taskConfig.Arguments...)
 	} else {
-		cmd = exec.Command(taskConfig.ProcessFilePath)
-	}
-	// Set working directory: prefer configured WorkingDirectory, else directory of the executable
-	workDir := strings.TrimSpace(taskConfig.WorkingDirectory)
-	if workDir == "" && taskConfig.ProcessFilePath != "" {
-		workDir = filepath.Dir(taskConfig.ProcessFilePath)
-	}
-	if workDir != "" {
+		cmd := exec.Command(task.ProcessFilePath, task.Arguments...)
 		cmd.Dir = workDir
-		log.Printf("simpleLaunch: setting working directory to '%s'", workDir)
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("Windows could not start %s.processFilePath=%q: %w. Check the executable path, %s.arguments, file permissions, and %s.workingDirectory", section, task.ProcessFilePath, err, section, section)
+		}
+		pid := cmd.Process.Pid
+		if err := cmd.Process.Release(); err != nil {
+			log.Printf("warning: %s started with PID %d but its process handle could not be released: %v", key, pid, err)
+		}
+		log.Printf("started %s with PID %d", key, pid)
 	}
 
-	err = cmd.Start()
-
-	if err != nil {
-		log.Printf("Failed to start %s: %v", task, err)
-		return
+	// Keep post-launch discovery serialized with other commands. The UI remains
+	// responsive, while no detached timer can race a later request.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(250 * time.Millisecond)
+		_, hwnd, err := winutil.FindProcessWindow(task.ProcessName, task.WindowTitleContains)
+		if err == nil && hwnd != 0 {
+			u.windowCache[key] = hwnd
+			return bringWindowToFront(hwnd)
+		}
 	}
-
-	log.Printf("Started %s with PID: %d", task, cmd.Process.Pid)
-
-	// If we have a title hint, try to bring that specific window/tab to front shortly after launch
-	if strings.TrimSpace(titleHint) != "" {
-		hint := titleHint
-		exe := task
-		time.AfterFunc(1500*time.Millisecond, func() {
-			if hwnd := winutil.FindProcessWindowByExeAndTitleContains(exe, hint); hwnd != 0 {
-				log.Printf("post-launch: found window by title contains '%s' for process %s; bringing to front", hint, exe)
-				bringWindowToFront(hwnd)
-			} else {
-				// Fallback: try any top-level window for the process
-				if _, h, err := winutil.FindFirstWindowByProcessName(exe); err == nil && h != 0 {
-					log.Printf("post-launch: fallback found top-level window for %s; bringing to front", exe)
-					bringWindowToFront(h)
-				}
-			}
-		})
-	}
+	return fmt.Errorf("the launch request returned successfully, but after 5 seconds no visible window matched %s.processName=%q and %s.windowTitleContains=%q. If the application opened, correct those matching fields; otherwise check %s.processFilePath and %s.arguments", section, task.ProcessName, section, task.WindowTitleContains, section, section)
 }
 
-// launchSystemExtension uses ShellExecute to launch system extensions like .c3p files
-func (u *UI) launchSystemExtension(filePath string, workDir string) {
-	log.Printf("launchSystemExtension: attempting to launch %s (workDir='%s')", filePath, workDir)
-	
-	// Convert strings to UTF16 for Windows API
+func validateLaunchTarget(section string, task config.Task, workDir string) error {
+	path := strings.TrimSpace(task.ProcessFilePath)
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("config field %s.processFilePath=%q is relative. Use the full Windows path, for example C:\\Program Files\\Vendor\\application.exe", section, path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("config field %s.processFilePath=%q does not exist. Correct the path in config.json or install/copy the target file there", section, path)
+		}
+		return fmt.Errorf("config field %s.processFilePath=%q cannot be accessed: %w. Check the path and the kiosk account's permissions", section, path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("config field %s.processFilePath=%q points to a directory; it must point to an executable or associated file", section, path)
+	}
+	if strings.TrimSpace(workDir) == "" {
+		return nil
+	}
+	if !filepath.IsAbs(workDir) {
+		return fmt.Errorf("%s.workingDirectory=%q is relative. Use a full Windows directory path or remove the field to use the processFilePath directory", section, workDir)
+	}
+	workInfo, err := os.Stat(workDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("the working directory %q does not exist. Correct %s.workingDirectory, or remove it to use the directory containing processFilePath", workDir, section)
+		}
+		return fmt.Errorf("the working directory %q cannot be accessed: %w. Check %s.workingDirectory and permissions", workDir, err, section)
+	}
+	if !workInfo.IsDir() {
+		return fmt.Errorf("%s.workingDirectory resolves to %q, which is not a directory", section, workDir)
+	}
+	return nil
+}
+
+func launchSystemExtension(filePath string, workDir string) error {
 	filePathPtr, err := syscall.UTF16PtrFromString(filePath)
 	if err != nil {
-		log.Printf("launchSystemExtension: failed to convert file path to UTF16: %v", err)
-		return
+		return fmt.Errorf("encode associated file path: %w", err)
 	}
-	
-	verbPtr, err := syscall.UTF16PtrFromString("open")
-	if err != nil {
-		log.Printf("launchSystemExtension: failed to convert verb to UTF16: %v", err)
-		return
-	}
-	
-	// Prepare lpDirectory if provided; if empty, try default to file's directory
-	var dirPtr uintptr
-	dir := strings.TrimSpace(workDir)
-	if dir == "" {
-		dir = filepath.Dir(filePath)
-	}
-	if dir != "" {
-		dirUTF16, err := syscall.UTF16PtrFromString(dir)
-		if err == nil {
-			dirPtr = uintptr(unsafe.Pointer(dirUTF16))
+	verbPtr, _ := syscall.UTF16PtrFromString("open")
+	var dirPtr *uint16
+	if strings.TrimSpace(workDir) != "" {
+		dirPtr, err = syscall.UTF16PtrFromString(workDir)
+		if err != nil {
+			return fmt.Errorf("encode working directory: %w", err)
 		}
 	}
 
-	// Call ShellExecute to open the file with its associated application
-	// ShellExecute(hwnd, lpOperation, lpFile, lpParameters, lpDirectory, nShowCmd)
-	ret, _, _ := procShellExecute.Call(
-		uintptr(u.hwnd),                               // hwnd - parent window handle
-		uintptr(unsafe.Pointer(verbPtr)),              // lpOperation - "open"
-		uintptr(unsafe.Pointer(filePathPtr)),          // lpFile - file to open
-		0,                                            // lpParameters - no parameters
-		dirPtr,                                       // lpDirectory - working directory
-		SW_SHOWNORMAL,                                // nShowCmd - show normally
-	)
-	
-	// ShellExecute returns a value > 32 on success
-	if ret <= 32 {
-		log.Printf("launchSystemExtension: ShellExecute failed with return code %d for file %s", ret, filePath)
-		return
+	info := SHELLEXECUTEINFO{
+		CbSize:      uint32(unsafe.Sizeof(SHELLEXECUTEINFO{})),
+		FMask:       SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI | SEE_MASK_UNICODE | SEE_MASK_FLAG_LOG_USAGE,
+		LpVerb:      verbPtr,
+		LpFile:      filePathPtr,
+		LpDirectory: dirPtr,
+		NShow:       SW_SHOWNORMAL,
 	}
-	
-	log.Printf("launchSystemExtension: successfully launched %s (return code: %d)", filePath, ret)
+	started := time.Now()
+	ok, _, callErr := procShellExecuteEx.Call(uintptr(unsafe.Pointer(&info)))
+	if ok == 0 {
+		return fmt.Errorf("ShellExecuteExW %s after %v: %w", filePath, time.Since(started), callErr)
+	}
+	if info.HProcess != 0 {
+		_ = windows.CloseHandle(info.HProcess)
+	}
+	log.Printf("associated-file launch for %s returned in %v", filePath, time.Since(started))
+	return nil
 }

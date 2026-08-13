@@ -17,9 +17,11 @@ import (
 )
 
 type UI struct {
-	hwnd windows.HWND
-	cfg  *config.AppConfig
-	kbd  *keyboard.Keyboard
+	hwnd  windows.HWND
+	cfg   *config.AppConfig
+	kbd   *keyboard.Keyboard
+	mw    *walk.MainWindow
+	label *walk.Label
 }
 
 var (
@@ -74,7 +76,7 @@ type MSG struct {
 }
 
 func main() {
-	cfg, err := config.Load(filepath.FromSlash("config.json"))
+	cfg, _, err := config.LoadOrCreate(filepath.FromSlash("config.json"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -124,20 +126,17 @@ func (u *UI) build() {
 		u.label.SetMinMaxSize(walk.Size{Width: 150, Height: height}, walk.Size{Width: 150, Height: height})
 	}
 
-	// Cloud button
-	cloudBtn, err := walk.NewPushButton(u.mw)
-	if err == nil {
-		cloudBtn.SetText("CLOUD MUSIC SYSTEM")
-		cloudBtn.SetMinMaxSize(walk.Size{Width: 200, Height: height}, walk.Size{Width: 200, Height: height})
-		cloudBtn.Clicked().Attach(func() { u.launchOrFocus(u.cfg.CloudTask) })
-	}
-
-	// Audio button
-	audioBtn, err := walk.NewPushButton(u.mw)
-	if err == nil {
-		audioBtn.SetText("AUDIO VISUAL SYSTEM")
-		audioBtn.SetMinMaxSize(walk.Size{Width: 200, Height: height}, walk.Size{Width: 200, Height: height})
-		audioBtn.Clicked().Attach(func() { u.launchOrFocus(u.cfg.WaveFrontTask) })
+	for _, configuredTask := range u.cfg.Tasks {
+		if !configuredTask.IsEnabled() {
+			continue
+		}
+		task := configuredTask
+		taskBtn, err := walk.NewPushButton(u.mw)
+		if err == nil {
+			taskBtn.SetText(task.ButtonLabel)
+			taskBtn.SetMinMaxSize(walk.Size{Width: 200, Height: height}, walk.Size{Width: 200, Height: height})
+			taskBtn.Clicked().Attach(func() { u.launchOrFocus(task) })
+		}
 	}
 
 	// Keyboard button
